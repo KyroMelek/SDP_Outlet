@@ -8,29 +8,35 @@
 #include <nvs_flash.h>
 #include <driver/adc.h>
 #include <esp_adc_cal.h>
-
-static const char *TAG = "OUTLET";
+#include <queue>
+#include <tuple>
 
 #include <iostream>
 using std::cout;
 using std::endl;
 
-// Used to detect zero crossing time
-float zeroVoltageTransformer = 0;
-float zeroCurrentTransformer = 0;
+static const char *TAG = "OUTLET";
 
 // one second average data to be sent to hub via zigbee
 struct data
 {
-  float apparentPower;
-  float timeShift;
+  uint64_t apparentPower;
+  uint64_t timeShift;
   time_t now;
 };
+uint64_t currentTimeShift = 0;
+
+std::queue<std::tuple<uint32_t, uint32_t>> instantaneousVIData;
+std::queue<data> PowerDataToSend;
+
+esp_adc_cal_characteristics_t *adc_chars = new (esp_adc_cal_characteristics_t);
+
+// Used to detect zero crossing time
+float zeroVoltageTransformer = 0;
+float zeroCurrentTransformer = 0;
 
 uint32_t transformerVoltageToRealVoltage(uint32_t voltage)
 {
-  int Rprime = 820000;
-  int Rsample = 100000;
   return voltage;
 }
 
@@ -64,9 +70,9 @@ static bool IRAM_ATTR timer_group_isr_callback(void *args)
 {
   BaseType_t high_task_awoken = pdFALSE;
 
-  uint64_t timer_counter_value = timer_group_get_counter_value_in_isr(TIMER_GROUP_0, TIMER_0);
+  // uint64_t timer_counter_value = timer_group_get_counter_value_in_isr(TIMER_GROUP_0, TIMER_0);
 
-  ISR_DATA isr_data = {timer_counter_value};
+  ISR_DATA isr_data = {0};
 
   /* Now just send the event data back to the main program task */
   xQueueSendFromISR(s_timer_queue, &isr_data, &high_task_awoken);
@@ -86,85 +92,99 @@ static void timer_setup_init(int group, int timer)
   // 80Mhz/160Hz = 500,000 for divider, however divider max is about 65,000 so we will divide by 5000 instead which yields 16Khz, therefore 16kHz/120Hz = 133.33 ticks (round down to 133 to sample slightly faster than 120)
   // ISR will execute every 133 ticks to sample at 120.3Hz
   timer_config_t config = {TIMER_ALARM_EN, TIMER_PAUSE, TIMER_INTR_LEVEL, TIMER_COUNT_UP, TIMER_AUTORELOAD_EN, 5000};
-
   timer_init(TIMER_GROUP_0, TIMER_0, &config);
-
   /* Timer's counter will initially start from value below.
      Also, if auto_reload is set, this value will be automatically reload on alarm */
   timer_set_counter_value(TIMER_GROUP_0, TIMER_0, 0);
-
   /* Configure the alarm value and the interrupt on alarm. */
   timer_set_alarm_value(TIMER_GROUP_0, TIMER_0, 133);
-
   timer_enable_intr(TIMER_GROUP_0, TIMER_0);
-
   timer_isr_callback_add(TIMER_GROUP_0, TIMER_0, timer_group_isr_callback, NULL, 0);
-
   timer_start(TIMER_GROUP_0, TIMER_0);
+}
+
+void VIMultiplication(void *pvParameters)
+{
+  int samples = 0;
+  uint64_t apparentPowerRunningSum = 0;
+  while (1)
+  {
+    while (!instantaneousVIData.empty())
+    {
+      samples++;
+      std::tuple<uint32_t, uint32_t> VI = instantaneousVIData.front();
+      instantaneousVIData.pop();
+      uint64_t apparentPower = (std::get<0>(VI) * std::get<1>(VI));
+      apparentPowerRunningSum += apparentPower;
+      if (samples >= 120)
+      {
+        uint64_t appPowOneSecAvg = (apparentPowerRunningSum /= samples);
+        time_t now;
+        time(&now);
+        data dataToSend = {.apparentPower = appPowOneSecAvg, .timeShift = currentTimeShift, .now = now};
+        cout << "Apparent Power: " << dataToSend.apparentPower << endl
+             << "time shift: " << dataToSend.timeShift << endl
+             << "time: " << dataToSend.now << endl;
+        PowerDataToSend.push(dataToSend);
+        samples = 0;
+        apparentPowerRunningSum = 0;
+      }
+    }
+    vTaskDelay(1);
+  }
+  vTaskDelay(1);
+}
+
+void sampleVI(void *pvParameters)
+{
+  float runningSumApparentPower = 0;
+  int samples = 0;
+  float apparentPowerOneSecondAverage = 0;
+  while (1)
+  {
+    ISR_DATA isr_data;
+    xQueueReceive(s_timer_queue, &isr_data, portMAX_DELAY);
+
+    // printf("Group[%d], timer[%d] alarm event\n", TIMER_GROUP_0, TIMER_0);
+    // /* Print the timer values passed by event */
+    // printf("------- EVENT TIME --------\n");
+    // print_timer_counter(isr_data.timer_counter_value);
+
+    // /* Print the timer values as visible by this task */
+    // printf("-------- TASK TIME --------\n");
+    // uint64_t task_counter_value;
+    // timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &task_counter_value);
+    // print_timer_counter(task_counter_value);
+
+    // Wait for the next cycle.
+    // xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+    // Perform action here. xWasDelayed value can be used to determine
+    // whether a deadline was missed if the code here took too long.
+    uint32_t ADCReadingV = adc1_get_raw(ADC1_CHANNEL_5);
+    uint32_t voltage = esp_adc_cal_raw_to_voltage(ADCReadingV, adc_chars);
+    cout << "Voltage reading is: " << voltage << "mV" << endl;
+
+    uint32_t ADCreadingI = adc1_get_raw(ADC1_CHANNEL_4);
+    uint32_t current = esp_adc_cal_raw_to_voltage(ADCreadingI, adc_chars);
+    cout << "Current reading is: " << current << "mA" << endl;
+
+    instantaneousVIData.push(std::make_tuple(voltage, current));
+  }
 }
 
 extern "C"
 {
   void app_main(void)
   {
-    esp_adc_cal_characteristics_t *adc_chars = new (esp_adc_cal_characteristics_t);
     esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 0, adc_chars);
     ESP_ERROR_CHECK(adc1_config_width(ADC_WIDTH_BIT_12));
     ESP_ERROR_CHECK(adc1_config_channel_atten(ADC1_CHANNEL_5, ADC_ATTEN_DB_11));
     ESP_ERROR_CHECK(adc1_config_channel_atten(ADC1_CHANNEL_4, ADC_ATTEN_DB_11));
 
     s_timer_queue = xQueueCreate(10, sizeof(ISR_DATA));
-
     timer_setup_init(TIMER_GROUP_0, TIMER_0);
 
-    float runningSumApparentPower = 0;
-    int samples = 0;
-    float apparentPowerOneSecondAverage = 0;
-    while (1)
-    {
-      ISR_DATA isr_data;
-      xQueueReceive(s_timer_queue, &isr_data, portMAX_DELAY);
-
-      // printf("Group[%d], timer[%d] alarm event\n", TIMER_GROUP_0, TIMER_0);
-      // /* Print the timer values passed by event */
-      // printf("------- EVENT TIME --------\n");
-      // print_timer_counter(isr_data.timer_counter_value);
-
-      // /* Print the timer values as visible by this task */
-      // printf("-------- TASK TIME --------\n");
-      // uint64_t task_counter_value;
-      // timer_get_counter_value(TIMER_GROUP_0, TIMER_0, &task_counter_value);
-      // print_timer_counter(task_counter_value);
-
-      // Wait for the next cycle.
-      // xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
-      // Perform action here. xWasDelayed value can be used to determine
-      // whether a deadline was missed if the code here took too long.
-
-      uint32_t ADCReadingV = adc1_get_raw(ADC1_CHANNEL_5);
-      uint32_t voltage = esp_adc_cal_raw_to_voltage(ADCReadingV, adc_chars);
-      cout << "Voltage reading is: " << voltage << "mV" << endl;
-
-      // uint32_t trueVoltage = transformerVoltageToRealVoltage(voltage);
-
-      uint32_t ADCreadingI = adc1_get_raw(ADC1_CHANNEL_4);
-      uint32_t current = esp_adc_cal_raw_to_voltage(ADCreadingI, adc_chars);
-      cout << "Current reading is: " << current << "mA" << endl;
-
-      // uint32_t trueCurrent = transformerCurrentToRealCurrent(current);
-
-      float apparentPower = voltage * current;
-
-      // cout << "Apparent Power reading is: " << apparentPower << "mW" << std::endl;
-
-      runningSumApparentPower += apparentPower;
-      samples++;
-      if (samples >= 120)
-      {
-        apparentPowerOneSecondAverage = runningSumApparentPower / samples;
-        samples = 0;
-        runningSumApparentPower = 0;
-      }
-    }
+    xTaskCreate(VIMultiplication, "VIMultiplication", 32768, NULL, 12, NULL);
+    xTaskCreate(sampleVI, "sampleVI", 32768, NULL, 12, NULL);
   }
 }
